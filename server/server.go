@@ -6,54 +6,58 @@ import (
 )
 
 // Basic type for the server.
-// Contains the channels needed to communicate.
+// Contains the two channels needed to close the server and send/receive messages
 type Server struct {
-	name        string
 	Done        chan bool
-	connections map[string]*Socket
-	Local       *Socket
+	connections map[string]*socket
+	Pipe        chan *Message
 }
 
-type Message struct {
-	Content string
-	Ip      string
-}
-
-type Socket struct {
+type socket struct {
 	Conn  *websocket.Conn
-	Pipe  chan *Message
-	addr  string
+	Host  string
 	Alive chan bool
 }
 
 // Creates a server listening on localhost port 1234
 func NewServer() *Server {
 	server := &Server{
-		name: "My Server",
 		Done: make(chan bool),
-		connections: make(map[string]*Socket),
-		Local: nil,
+		connections: make(map[string]*socket),
+		Pipe: make(chan *Message),
 	}
-	go func() {
-		http.Handle("/", websocket.Handler(createHandler(server)))
-		err := http.ListenAndServe(":1234", nil)
-		if err != nil {
-			server.Done <- true
-			panic("ListenAndServe: " + err.Error())
-		}
-	}()
+	go server.startHttpListener()
+	go server.handleOutbound()
+
 	return server;
 }
+
+// Send the signal to close the server and all connections
+func (server *Server) CloseConnections() {
+	server.Done <- true
+}
+
+
+
 func createHandler(server *Server) (func(*websocket.Conn)) {
 	return func(conn *websocket.Conn) {
-		socket := server.AddConnection(conn)
-		go handleInbound(socket)
-		go handleOutbound(socket)
+		socket := server.addConnection(conn)
+		server.Pipe <- NewMessage(socket.Host, "", CONNECTION_ESTABLISHED)
+		go server.handleInbound(socket)
 		<-socket.Alive
 	}
 }
 
-func handleInbound(socket *Socket) {
+func (server *Server) startHttpListener() {
+	http.Handle("/", websocket.Handler(createHandler(server)))
+	err := http.ListenAndServe(":1234", nil)
+	if err != nil {
+		server.Done <- true
+		panic("ListenAndServe: " + err.Error())
+	}
+}
+
+func (server *Server) handleInbound(socket *socket) {
 	var err error
 	for {
 		var message string
@@ -61,43 +65,42 @@ func handleInbound(socket *Socket) {
 			fmt.Println("Cannot receive: " + err.Error())
 			break
 		}
-		socket.SendMessage(message)
+		server.Pipe <- NewMessage(socket.Host, message, INBOUND)
 	}
 }
 
 
-func handleOutbound(socket *Socket) {
-	select {
-	case message := <-socket.Pipe:
-		fmt.Println(message)
+func (server *Server) handleOutbound() {
+	for {
+		select {
+		case message := <-server.Pipe:
+			if socket := server.connections[message.Host]; socket != nil {
+				fmt.Println("Sending " + message.Content + " to " + socket.Host)
+				fmt.Fprint(socket.Conn, message.Content)
+			}
+		case <-server.Done:
+			fmt.Println("stopping outbound channel")
+		}
 	}
 }
 
-func (socket *Socket) SendMessage(content string) {
-	message := &Message{
-		Content: content,
-		Ip: socket.addr,
+
+// Actually close the server and the connections
+func (server *Server) onCloseConnections() {
+	<-server.Done
+	for _, socket := range server.connections {
+		socket.Alive <- false
 	}
-	socket.Pipe <- message
 }
 
-func (server *Server) AddConnection(ws *websocket.Conn) *Socket {
-	socket := &Socket{
+
+func (server *Server) addConnection(ws *websocket.Conn) *socket {
+	socket := &socket{
 		Conn: ws,
-		Pipe: make(chan *Message),
-		addr: ws.Request().RemoteAddr,
+		Host: ws.Request().RemoteAddr,
 		Alive: make(chan bool),
 	}
-	if IsLocalhost(ws.Request().RemoteAddr) {
-		fmt.Println("Local connection from ", socket.addr)
-		server.Local = socket
-	} else {
-		fmt.Println("Remote connection from ", socket.addr)
-		server.connections[socket.addr] = socket
-	}
+	server.connections[socket.Host] = socket
+	fmt.Println("Connection from ", socket.Host)
 	return socket
 }
-
-
-
-
